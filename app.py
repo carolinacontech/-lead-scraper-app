@@ -59,31 +59,23 @@ EXCLUDE_KEYWORDS = [
 
 
 def is_relevant_business(name, types, search_query):
-    """
-    Returns True if the business is relevant to the search.
-    Checks name and Google place types against keyword lists.
-    """
     name_lower = name.lower()
     types_str = " ".join(types).lower() if types else ""
     query_lower = search_query.lower()
 
-    # Immediately discard if name contains exclude keywords
     for kw in EXCLUDE_KEYWORDS:
         if kw in name_lower:
             return False
 
-    # Check if name contains the search query words
     query_words = query_lower.split()
     for word in query_words:
         if len(word) > 3 and word in name_lower:
             return True
 
-    # Check if name contains any relevant keyword
     for kw in RELEVANT_KEYWORDS:
         if kw in name_lower:
             return True
 
-    # Check Google place types
     relevant_types = [
         "general_contractor", "roofing_contractor", "painter",
         "plumber", "electrician", "landscaper", "lawn_care",
@@ -153,25 +145,33 @@ def search_one_point(lat, lng, keyword, api_key, sub_radius=15000):
     return results
 
 
-def search_full_city(query, location, api_key, radius_meters):
+def search_full_city_gen(query, location, api_key, radius_meters):
     """
-    Searches across all grid points for a city.
-    Deduplicates results across all points.
+    Generator version of search_full_city.
+    Yields SSE-ready dicts for progress updates, then a final
+    {'type': '_results', 'results': [...]} dict with all places found.
     """
     seen_ids = set()
     all_results = []
 
-    # Get city center
     city_lat, city_lng = geocode_city(location, api_key)
     if not city_lat:
-        print(f"Could not geocode: {location}")
-        return [], None, None
+        yield {"type": "error", "message": f"Could not geocode: {location}"}
+        yield {"type": "_results", "results": [], "city_lat": None, "city_lng": None}
+        return
 
-    # Generate all search points
+    yield {
+        "type": "city_center",
+        "lat": city_lat, "lng": city_lng,
+        "city": location, "radius_meters": radius_meters
+    }
+
     points = get_search_points(city_lat, city_lng, radius_meters)
-    print(f"Searching {len(points)} points in {location}")
+    yield {"type": "status", "message": f"Scanning {len(points)} zones in {location}..."}
 
     for i, (lat, lng) in enumerate(points):
+        yield {"type": "status", "message": f"Zone {i+1}/{len(points)} — searching {location}..."}
+
         point_results = search_one_point(lat, lng, query, api_key, sub_radius=25000)
 
         new_count = 0
@@ -182,10 +182,13 @@ def search_full_city(query, location, api_key, radius_meters):
                 all_results.append(r)
                 new_count += 1
 
-        print(f"  Point {i+1}/{len(points)}: {len(point_results)} found, {new_count} new")
+        yield {
+            "type": "zone_done",
+            "message": f"Zone {i+1}/{len(points)}: {new_count} new businesses ({len(all_results)} total so far)"
+        }
         time.sleep(0.5)
 
-    return all_results, city_lat, city_lng
+    yield {"type": "_results", "results": all_results, "city_lat": city_lat, "city_lng": city_lng}
 
 
 def get_place_details(place_id, api_key):
@@ -208,39 +211,24 @@ def get_place_details(place_id, api_key):
 
 
 def has_recent_review(details, months=12):
-    """
-    Returns True if the business has at least one review
-    from the last 12 months. Uses the review timestamps
-    returned by Places Details API.
-    """
     reviews = details.get("reviews", [])
     if not reviews:
         return False
-
     cutoff = time.time() - (months * 30 * 24 * 3600)
-
     for review in reviews:
         review_time = review.get("time", 0)
         if review_time >= cutoff:
             return True
-
     return False
 
 
 def is_website_alive(url):
-    """
-    Checks if a website is actually accessible.
-    Returns True if the site loads, False if it errors or times out.
-    """
     if not url:
         return False
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=6, allow_redirects=True)
-        # Accept any 2xx or 3xx response
-        if r.status_code < 400:
-            return True
-        return False
+        return r.status_code < 400
     except:
         return False
 
@@ -318,19 +306,32 @@ def scrape():
         all_leads = []
         seen_ids = set()
 
+        total_combos = len(locations) * len(business_types)
+        combo_num = 0
+
         for location in locations:
             for business_type in business_types:
-                yield f"data: {json.dumps({'type': 'status', 'message': f'Searching: {business_type} in {location}...'})}\n\n"
+                combo_num += 1
+                yield f"data: {json.dumps({'type': 'status', 'message': f'[{combo_num}/{total_combos}] Searching: {business_type} in {location}...'})}\\n\\n"
 
                 try:
-                    places, city_lat, city_lng = search_full_city(business_type, location, api_key, radius_meters)
+                    # --- PHASE 1: collect all places with live zone-by-zone updates ---
+                    places = []
+                    city_lat = city_lng = None
 
-                    if city_lat and city_lng:
-                        yield f"data: {json.dumps({'type': 'city_center', 'lat': city_lat, 'lng': city_lng, 'city': location, 'radius_meters': radius_meters})}\n\n"
+                    for event in search_full_city_gen(business_type, location, api_key, radius_meters):
+                        if event["type"] == "_results":
+                            places = event["results"]
+                            city_lat = event.get("city_lat")
+                            city_lng = event.get("city_lng")
+                        else:
+                            yield f"data: {json.dumps(event)}\\n\\n"
 
-                    yield f"data: {json.dumps({'type': 'status', 'message': f'Found {len(places)} businesses in {location} — filtering...'})}\n\n"
+                    yield f"data: {json.dumps({'type': 'status', 'message': f'Found {len(places)} businesses in {location} — filtering...'})}\\n\\n"
 
-                    for place in places:
+                    # --- PHASE 2: enrich & filter with per-lead progress ---
+                    qualifying = 0
+                    for idx, place in enumerate(places):
                         place_id = place.get("place_id")
                         if not place_id or place_id in seen_ids:
                             continue
@@ -339,13 +340,14 @@ def scrape():
                         reviews = place.get("user_ratings_total", 0)
                         rating = place.get("rating", 0)
 
-                        # Minimum 5 reviews required
-                        if reviews < 5:
-                            continue
-                        if reviews > max_reviews:
+                        if reviews < 5 or reviews > max_reviews:
                             continue
                         if rating < min_rating and reviews > 0:
                             continue
+
+                        # Send progress every 10 businesses processed
+                        if (idx + 1) % 10 == 0:
+                            yield f"data: {json.dumps({'type': 'status', 'message': f'Qualifying {idx+1}/{len(places)} — {qualifying} leads so far...'})}\\n\\n"
 
                         details = get_place_details(place_id, api_key)
                         time.sleep(0.1)
@@ -358,21 +360,16 @@ def scrape():
 
                         if status != "OPERATIONAL":
                             continue
-
-                        # Phone is mandatory
                         if not phone or phone.strip() == "":
                             continue
 
-                        # Filter out irrelevant businesses
                         place_types = place.get("types", [])
                         if not is_relevant_business(name, place_types, business_type):
                             continue
 
-                        # Verify website is actually accessible
                         if website and not is_website_alive(website):
                             continue
 
-                        # Must have at least one review in the last 12 months
                         if not has_recent_review(details):
                             continue
 
@@ -385,6 +382,7 @@ def scrape():
                         if calificacion is None:
                             continue
 
+                        qualifying += 1
                         place_lat = place.get("geometry", {}).get("location", {}).get("lat", 0)
                         place_lng = place.get("geometry", {}).get("location", {}).get("lng", 0)
 
@@ -406,14 +404,14 @@ def scrape():
                         }
 
                         all_leads.append(lead)
-                        yield f"data: {json.dumps({'type': 'lead', 'lead': lead})}\n\n"
+                        yield f"data: {json.dumps({'type': 'lead', 'lead': lead})}\\n\\n"
 
                 except Exception as e:
-                    yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+                    yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\\n\\n"
 
                 time.sleep(0.5)
 
-        yield f"data: {json.dumps({'type': 'done', 'total': len(all_leads)})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'total': len(all_leads)})}\\n\\n"
 
     return Response(generate(), mimetype="text/event-stream")
 
