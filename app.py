@@ -5,9 +5,14 @@ import time
 import io
 import json
 import math
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
+
+# API key is read from environment variable on the server.
+# Set GOOGLE_PLACES_API_KEY in Render's Environment settings.
+SERVER_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
 
 # ============================================================
 # GENERATE SEARCH POINTS AROUND A CITY
@@ -104,7 +109,11 @@ def geocode_city(location, api_key):
     return None, None
 
 
-def search_one_point(lat, lng, keyword, api_key, sub_radius=25000):
+def search_one_point(lat, lng, keyword, api_key, sub_radius=25000, max_seconds=25):
+    """
+    Searches one point with pagination, but never runs longer than
+    max_seconds total — prevents getting stuck on a slow next_page_token.
+    """
     url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
     results = []
     params = {
@@ -113,10 +122,15 @@ def search_one_point(lat, lng, keyword, api_key, sub_radius=25000):
         "keyword": keyword,
         "key": api_key
     }
+    start_time = time.time()
 
     for page_num in range(3):
+        if time.time() - start_time > max_seconds:
+            print(f"Zone timeout after {max_seconds}s, returning {len(results)} results so far")
+            break
+
         try:
-            r = requests.get(url, params=params, timeout=10)
+            r = requests.get(url, params=params, timeout=8)
             data = r.json()
             status = data.get("status", "")
 
@@ -132,7 +146,10 @@ def search_one_point(lat, lng, keyword, api_key, sub_radius=25000):
             if not next_token:
                 break
 
-            time.sleep(3)
+            if time.time() - start_time > max_seconds - 4:
+                break
+
+            time.sleep(2.5)
             params = {"pagetoken": next_token, "key": api_key}
 
         except Exception as e:
@@ -146,9 +163,12 @@ def search_full_city_gen(query, location, api_key, radius_meters):
     """
     Generator that yields SSE-ready progress dicts, then a final
     {'type': '_results', 'results': [...]} dict with all places found.
+    Has an overall safety timeout so a slow zone never blocks forever.
     """
     seen_ids = set()
     all_results = []
+    city_start_time = time.time()
+    MAX_CITY_SECONDS = 180  # 3 minutes max per city search phase
 
     city_lat, city_lng = geocode_city(location, api_key)
     if not city_lat:
@@ -166,9 +186,13 @@ def search_full_city_gen(query, location, api_key, radius_meters):
     yield {"type": "status", "message": f"Scanning {len(points)} zones in {location}..."}
 
     for i, (lat, lng) in enumerate(points):
+        if time.time() - city_start_time > MAX_CITY_SECONDS:
+            yield {"type": "status", "message": f"Time limit reached for {location}, moving on with {len(all_results)} results"}
+            break
+
         yield {"type": "status", "message": f"Zone {i+1}/{len(points)} — searching {location}..."}
 
-        point_results = search_one_point(lat, lng, query, api_key, sub_radius=25000)
+        point_results = search_one_point(lat, lng, query, api_key, sub_radius=25000, max_seconds=25)
 
         new_count = 0
         for r in point_results:
@@ -200,10 +224,32 @@ def get_place_details(place_id, api_key):
         "key": api_key
     }
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=8)
         return r.json().get("result", {})
     except:
         return {}
+
+
+def get_place_details_parallel(place_ids, api_key, max_workers=15):
+    """
+    Fetches Place Details for many place_ids in parallel.
+    Returns: dict {place_id: details_dict}
+    """
+    results = {}
+
+    def fetch_one(pid):
+        return pid, get_place_details(pid, api_key)
+
+    if not place_ids:
+        return results
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(fetch_one, pid) for pid in place_ids]
+        for future in as_completed(futures):
+            pid, details = future.result()
+            results[pid] = details
+
+    return results
 
 
 def has_recent_review(details, months=12):
@@ -305,7 +351,7 @@ def index():
 def scrape():
     data = request.json
 
-    api_key = data.get("api_key", "").strip()
+    api_key = SERVER_API_KEY
     business_types_raw = data.get("business_types", "")
     locations_raw = data.get("locations", "")
     max_reviews = int(data.get("max_reviews", 200))
@@ -316,7 +362,7 @@ def scrape():
     radius_meters = int(radius_miles * 1609.34)
 
     if not api_key:
-        return jsonify({"error": "API Key required"}), 400
+        return jsonify({"error": "Server is missing GOOGLE_PLACES_API_KEY. Contact admin."}), 400
 
     business_types = [b.strip() for b in business_types_raw.split(",") if b.strip()]
     locations = [l.strip() for l in locations_raw.split(",") if l.strip()]
@@ -330,9 +376,15 @@ def scrape():
 
         total_combos = len(locations) * len(business_types)
         combo_num = 0
+        overall_start = time.time()
+        MAX_TOTAL_SECONDS = 25 * 60  # 25 minutes hard cap, under Render free's 30 min limit
 
         for location in locations:
             for business_type in business_types:
+                if time.time() - overall_start > MAX_TOTAL_SECONDS:
+                    yield f"data: {json.dumps({'type': 'status', 'message': 'Time limit reached (25 min). Stopping here to avoid server timeout.'})}\n\n"
+                    break
+
                 combo_num += 1
                 yield f"data: {json.dumps({'type': 'status', 'message': f'[{combo_num}/{total_combos}] Searching: {business_type} in {location}...'})}\n\n"
 
@@ -345,10 +397,10 @@ def scrape():
                         else:
                             yield f"data: {json.dumps(event)}\n\n"
 
-                    yield f"data: {json.dumps({'type': 'status', 'message': f'Found {len(places)} businesses in {location} — applying fast filters...'})}\n\n"
+                    yield f"data: {json.dumps({'type': 'status', 'message': f'Found {len(places)} businesses in {location} — pre-filtering...'})}\n\n"
 
-                    # PHASE 2: fast filters + fetch details (no slow website checks yet)
-                    candidates = []
+                    # PHASE 2a: cheap filters first (no API calls needed) to shrink the list
+                    pre_filtered = []
                     for place in places:
                         place_id = place.get("place_id")
                         if not place_id or place_id in seen_ids:
@@ -363,13 +415,27 @@ def scrape():
                         if rating < min_rating and reviews > 0:
                             continue
 
-                        details = get_place_details(place_id, api_key)
+                        pre_filtered.append(place)
+
+                    # PHASE 2b: fetch Place Details for all survivors, in parallel
+                    yield f"data: {json.dumps({'type': 'status', 'message': f'Fetching details for {len(pre_filtered)} businesses in parallel...'})}\n\n"
+
+                    place_ids = [p.get("place_id") for p in pre_filtered]
+                    details_map = get_place_details_parallel(place_ids, api_key, max_workers=15)
+
+                    # PHASE 2c: apply detail-dependent filters
+                    candidates = []
+                    for place in pre_filtered:
+                        place_id = place.get("place_id")
+                        details = details_map.get(place_id, {})
 
                         name = details.get("name", place.get("name", "N/A"))
                         phone = details.get("formatted_phone_number", "")
                         website = details.get("website", "")
                         address = details.get("formatted_address", place.get("formatted_address", ""))
                         status = details.get("business_status", "OPERATIONAL")
+                        reviews = place.get("user_ratings_total", 0)
+                        rating = place.get("rating", 0)
 
                         if status != "OPERATIONAL":
                             continue
@@ -443,6 +509,9 @@ def scrape():
                     yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
                 time.sleep(0.3)
+
+            if time.time() - overall_start > MAX_TOTAL_SECONDS:
+                break
 
         yield f"data: {json.dumps({'type': 'done', 'total': len(all_leads)})}\n\n"
 
