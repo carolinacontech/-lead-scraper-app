@@ -5,6 +5,7 @@ import time
 import io
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
@@ -17,11 +18,10 @@ def get_search_points(center_lat, center_lng, radius_meters):
     Returns a list of (lat, lng) points covering the search area.
     Capped at 7 points max for speed. Each point covers 25km radius.
     """
-    points = [(center_lat, center_lng)]  # center point
+    points = [(center_lat, center_lng)]
     R = 6371000
-    sub_radius = 25000  # 25km per point — wider coverage, fewer points
+    sub_radius = 25000
 
-    # Only 1 ring of 6 points around the center = 7 total max
     ring_distance = sub_radius * 1.2
     for i in range(6):
         angle = (2 * math.pi * i) / 6
@@ -35,10 +35,9 @@ def get_search_points(center_lat, center_lng, radius_meters):
 
 
 # ============================================================
-# GOOGLE PLACES FUNCTIONS
+# RELEVANCE FILTER
 # ============================================================
 
-# Keywords that must appear in business name or types
 RELEVANT_KEYWORDS = [
     "tree", "arbor", "arborist", "stump", "trimming",
     "pruning", "land clearing", "landscap", "lawn",
@@ -47,7 +46,6 @@ RELEVANT_KEYWORDS = [
     "handyman", "remodel", "construct", "demo"
 ]
 
-# Keywords that immediately discard a business
 EXCLUDE_KEYWORDS = [
     "hair", "salon", "barber", "beauty", "nail", "spa",
     "restaurant", "pizza", "taco", "burger", "sushi",
@@ -88,6 +86,10 @@ def is_relevant_business(name, types, search_query):
     return False
 
 
+# ============================================================
+# GOOGLE PLACES FUNCTIONS
+# ============================================================
+
 def geocode_city(location, api_key):
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     params = {"address": location, "key": api_key}
@@ -102,11 +104,7 @@ def geocode_city(location, api_key):
     return None, None
 
 
-def search_one_point(lat, lng, keyword, api_key, sub_radius=15000):
-    """
-    Search a single point with full pagination.
-    Returns up to 60 results (3 pages x 20).
-    """
+def search_one_point(lat, lng, keyword, api_key, sub_radius=25000):
     url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
     results = []
     params = {
@@ -134,7 +132,6 @@ def search_one_point(lat, lng, keyword, api_key, sub_radius=15000):
             if not next_token:
                 break
 
-            # Google requires 2-3 second delay before next page
             time.sleep(3)
             params = {"pagetoken": next_token, "key": api_key}
 
@@ -147,8 +144,7 @@ def search_one_point(lat, lng, keyword, api_key, sub_radius=15000):
 
 def search_full_city_gen(query, location, api_key, radius_meters):
     """
-    Generator version of search_full_city.
-    Yields SSE-ready dicts for progress updates, then a final
+    Generator that yields SSE-ready progress dicts, then a final
     {'type': '_results', 'results': [...]} dict with all places found.
     """
     seen_ids = set()
@@ -186,7 +182,7 @@ def search_full_city_gen(query, location, api_key, radius_meters):
             "type": "zone_done",
             "message": f"Zone {i+1}/{len(points)}: {new_count} new businesses ({len(all_results)} total so far)"
         }
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     yield {"type": "_results", "results": all_results, "city_lat": city_lat, "city_lng": city_lng}
 
@@ -227,10 +223,36 @@ def is_website_alive(url):
         return False
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=6, allow_redirects=True)
+        r = requests.get(url, headers=headers, timeout=4, allow_redirects=True)
         return r.status_code < 400
     except:
         return False
+
+
+def check_websites_parallel(place_website_pairs, max_workers=15):
+    """
+    Checks multiple websites in parallel using a thread pool.
+    Input: list of (key, url) tuples.
+    Returns: dict {key: True/False}
+    """
+    results = {}
+
+    def check_one(pair):
+        key, url = pair
+        if not url:
+            return key, False
+        return key, is_website_alive(url)
+
+    if not place_website_pairs:
+        return results
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(check_one, pair) for pair in place_website_pairs]
+        for future in as_completed(futures):
+            key, alive = future.result()
+            results[key] = alive
+
+    return results
 
 
 def calificar_lead(reviews, website, address, max_reviews, min_rating, rating, require_website, require_address):
@@ -312,26 +334,22 @@ def scrape():
         for location in locations:
             for business_type in business_types:
                 combo_num += 1
-                yield f"data: {json.dumps({'type': 'status', 'message': f'[{combo_num}/{total_combos}] Searching: {business_type} in {location}...'})}\\n\\n"
+                yield f"data: {json.dumps({'type': 'status', 'message': f'[{combo_num}/{total_combos}] Searching: {business_type} in {location}...'})}\n\n"
 
                 try:
-                    # --- PHASE 1: collect all places with live zone-by-zone updates ---
+                    # PHASE 1: collect all places with live zone-by-zone updates
                     places = []
-                    city_lat = city_lng = None
-
                     for event in search_full_city_gen(business_type, location, api_key, radius_meters):
                         if event["type"] == "_results":
                             places = event["results"]
-                            city_lat = event.get("city_lat")
-                            city_lng = event.get("city_lng")
                         else:
-                            yield f"data: {json.dumps(event)}\\n\\n"
+                            yield f"data: {json.dumps(event)}\n\n"
 
-                    yield f"data: {json.dumps({'type': 'status', 'message': f'Found {len(places)} businesses in {location} — filtering...'})}\\n\\n"
+                    yield f"data: {json.dumps({'type': 'status', 'message': f'Found {len(places)} businesses in {location} — applying fast filters...'})}\n\n"
 
-                    # --- PHASE 2: enrich & filter with per-lead progress ---
-                    qualifying = 0
-                    for idx, place in enumerate(places):
+                    # PHASE 2: fast filters + fetch details (no slow website checks yet)
+                    candidates = []
+                    for place in places:
                         place_id = place.get("place_id")
                         if not place_id or place_id in seen_ids:
                             continue
@@ -345,12 +363,7 @@ def scrape():
                         if rating < min_rating and reviews > 0:
                             continue
 
-                        # Send progress every 10 businesses processed
-                        if (idx + 1) % 10 == 0:
-                            yield f"data: {json.dumps({'type': 'status', 'message': f'Qualifying {idx+1}/{len(places)} — {qualifying} leads so far...'})}\\n\\n"
-
                         details = get_place_details(place_id, api_key)
-                        time.sleep(0.1)
 
                         name = details.get("name", place.get("name", "N/A"))
                         phone = details.get("formatted_phone_number", "")
@@ -367,34 +380,54 @@ def scrape():
                         if not is_relevant_business(name, place_types, business_type):
                             continue
 
-                        if website and not is_website_alive(website):
-                            continue
-
                         if not has_recent_review(details):
                             continue
 
+                        candidates.append({
+                            "place_id": place_id,
+                            "place": place,
+                            "name": name,
+                            "phone": phone,
+                            "website": website,
+                            "address": address,
+                            "reviews": reviews,
+                            "rating": rating,
+                        })
+
+                    # PHASE 3: check all websites in parallel — the slow part, done once
+                    yield f"data: {json.dumps({'type': 'status', 'message': f'Checking {len(candidates)} websites in parallel...'})}\n\n"
+
+                    website_pairs = [(c["place_id"], c["website"]) for c in candidates if c["website"]]
+                    website_status = check_websites_parallel(website_pairs, max_workers=15)
+
+                    # PHASE 4: build final leads
+                    for c in candidates:
+                        website = c["website"]
+
+                        if website and not website_status.get(c["place_id"], False):
+                            continue
+
                         calificacion, dolor = calificar_lead(
-                            reviews, website, address,
-                            max_reviews, min_rating, rating,
+                            c["reviews"], website, c["address"],
+                            max_reviews, min_rating, c["rating"],
                             require_website, require_address
                         )
 
                         if calificacion is None:
                             continue
 
-                        qualifying += 1
-                        place_lat = place.get("geometry", {}).get("location", {}).get("lat", 0)
-                        place_lng = place.get("geometry", {}).get("location", {}).get("lng", 0)
+                        place_lat = c["place"].get("geometry", {}).get("location", {}).get("lat", 0)
+                        place_lng = c["place"].get("geometry", {}).get("location", {}).get("lng", 0)
 
                         lead = {
-                            "Name": name,
-                            "Phone": phone,
+                            "Name": c["name"],
+                            "Phone": c["phone"],
                             "Website": website,
-                            "Address": address,
+                            "Address": c["address"],
                             "City": location,
                             "Type": business_type,
-                            "Reviews": reviews,
-                            "Rating": rating,
+                            "Reviews": c["reviews"],
+                            "Rating": c["rating"],
                             "Calificacion": calificacion,
                             "Tags": dolor,
                             "Status": "Pending call",
@@ -404,14 +437,14 @@ def scrape():
                         }
 
                         all_leads.append(lead)
-                        yield f"data: {json.dumps({'type': 'lead', 'lead': lead})}\\n\\n"
+                        yield f"data: {json.dumps({'type': 'lead', 'lead': lead})}\n\n"
 
                 except Exception as e:
-                    yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\\n\\n"
+                    yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
-                time.sleep(0.5)
+                time.sleep(0.3)
 
-        yield f"data: {json.dumps({'type': 'done', 'total': len(all_leads)})}\\n\\n"
+        yield f"data: {json.dumps({'type': 'done', 'total': len(all_leads)})}\n\n"
 
     return Response(generate(), mimetype="text/event-stream")
 
